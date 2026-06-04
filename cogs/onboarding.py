@@ -130,6 +130,7 @@ class OnboardingStore:
         settings.setdefault("dm_message_template", DEFAULT_DM_MESSAGE_TEMPLATE)
         settings.setdefault("default_posts", 1)
         settings.setdefault("last_report_checkpoint", None)
+        settings.setdefault("report_channel_id", None)
         return state
 
     def settings(self, guild_id: int) -> Dict[str, Any]:
@@ -265,6 +266,7 @@ class OnboardingStore:
         delivery_mode: str,
         public_message_templates: List[str],
         dm_message_template: str,
+        report_channel_id: Optional[int],
     ) -> None:
         settings = self.settings(guild_id)
         templates = [ensure_public_mentions(template) for template in public_message_templates]
@@ -281,6 +283,7 @@ class OnboardingStore:
         settings["selected_public_template_index"] = selected_index
         settings["public_message_template"] = templates[selected_index]
         settings["dm_message_template"] = dm_message_template.strip() or DEFAULT_DM_MESSAGE_TEMPLATE
+        settings["report_channel_id"] = report_channel_id
         self.save()
 
     def public_templates(self, guild_id: int) -> List[str]:
@@ -311,6 +314,50 @@ class OnboardingStore:
         settings["selected_public_template_index"] = template_index
         settings["public_message_template"] = templates[template_index]
         self.save()
+
+
+class WeeklyReportModal(discord.ui.Modal, title="Run Weekly Growth Report"):
+    channel_id = discord.ui.TextInput(
+        label="Post publicly to Channel ID",
+        required=False,
+        max_length=24,
+        placeholder="Enter channel ID, or leave blank for this channel."
+    )
+
+    def __init__(self, cog: "OnboardingCog", default_channel_id: Optional[int] = None):
+        super().__init__()
+        self.cog = cog
+        if default_channel_id:
+            self.channel_id.default = str(default_channel_id)
+        else:
+            settings = cog.store.settings(cog.bot.guilds[0].id) if cog.bot.guilds else {}
+            saved_id = settings.get("report_channel_id") if settings else None
+            if saved_id:
+                self.channel_id.default = str(saved_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        target_channel_id = str(self.channel_id.value).strip()
+        if target_channel_id:
+            try:
+                channel_id = int(target_channel_id)
+                channel = interaction.guild.get_channel(channel_id) or await interaction.guild.fetch_channel(channel_id)
+            except Exception:
+                await interaction.followup.send("❌ Invalid channel ID. Please provide a valid channel ID.", ephemeral=True)
+                return
+        else:
+            channel = interaction.channel
+
+        if not channel or not hasattr(channel, "send"):
+            await interaction.followup.send("❌ I cannot find or access that channel, or it cannot receive messages.", ephemeral=True)
+            return
+
+        settings = self.cog.store.settings(interaction.guild_id)
+        settings["report_channel_id"] = channel.id
+        self.cog.store.save()
+
+        await self.cog.run_weekly_report(interaction, channel)
 
 
 class OnboardingSettingsModal(discord.ui.Modal, title="Onboarding Settings"):
@@ -360,6 +407,9 @@ class OnboardingSettingsModal(discord.ui.Modal, title="Onboarding Settings"):
 
         public_templates = parse_template_block(str(self.public_message_template.value))
 
+        settings = self.cog.store.settings(interaction.guild_id)
+        report_channel_id = settings.get("report_channel_id")
+
         self.cog.store.update_settings(
             interaction.guild_id,
             channel_id,
@@ -367,6 +417,7 @@ class OnboardingSettingsModal(discord.ui.Modal, title="Onboarding Settings"):
             delivery_mode,
             public_templates,
             str(self.dm_message_template.value).strip(),
+            report_channel_id,
         )
         self.view.delivery_mode = delivery_mode
         self.view.selected_template_index = self.cog.store.selected_public_template_index(interaction.guild_id)
@@ -574,7 +625,9 @@ class OnboardingDashboardView(discord.ui.View):
 
     @discord.ui.button(label="Monday Weekly Report", style=discord.ButtonStyle.blurple, row=1)
     async def monday_report_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.cog.run_weekly_report(interaction)
+        settings = self.cog.store.settings(interaction.guild_id)
+        default_id = settings.get("report_channel_id") or interaction.channel_id
+        await interaction.response.send_modal(WeeklyReportModal(self.cog, default_channel_id=default_id))
 
     @discord.ui.button(label="Make Checkpoint", style=discord.ButtonStyle.gray, row=1)
     async def make_checkpoint_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -987,7 +1040,7 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
             return await self.send_group(guild, date_key, settings.get("delivery_mode", DELIVERY_CHANNEL))
         return await self.send_latest_group(guild, settings.get("delivery_mode", DELIVERY_CHANNEL))
 
-    async def run_weekly_report(self, interaction: discord.Interaction):
+    async def run_weekly_report(self, interaction: discord.Interaction, channel: discord.abc.Messageable):
         # Scan first to ensure we have up-to-date data
         guild = interaction.guild
         if not guild:
@@ -1128,7 +1181,11 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
         settings["last_report_checkpoint"] = current_run_time.isoformat()
         self.store.save()
             
-        await interaction.followup.send(embed=embed, file=discord_file, ephemeral=True)
+        # Send publicly
+        await channel.send(embed=embed, file=discord_file)
+
+        # Confirm ephemerally
+        await interaction.followup.send(f"📊 Weekly Growth Report generated and posted to {channel.mention}.", ephemeral=True)
         
         # Log to audit logs
         await self.log_action(

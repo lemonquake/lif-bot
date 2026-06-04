@@ -329,7 +329,10 @@ class ModPanelView(discord.ui.View):
     async def weekly_report_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         cog = self.bot.get_cog("OnboardingCog")
         if cog:
-            await cog.run_weekly_report(interaction)
+            from cogs.onboarding import WeeklyReportModal
+            settings = cog.store.settings(interaction.guild_id)
+            default_id = settings.get("report_channel_id") or interaction.channel_id
+            await interaction.response.send_modal(WeeklyReportModal(cog, default_channel_id=default_id))
         else:
             await interaction.response.send_message("Onboarding feature is currently unavailable.", ephemeral=True)
 
