@@ -388,7 +388,7 @@ class ReportChannelSelect(discord.ui.ChannelSelect):
     def __init__(self, setup_view: "WeeklyReportSetupView"):
         self.setup_view = setup_view
         super().__init__(
-            placeholder="Optional: Select channel to post publicly...",
+            placeholder="Select private mod channel (e.g. #staff)...",
             min_values=1,
             max_values=1,
             channel_types=[discord.ChannelType.text],
@@ -396,7 +396,28 @@ class ReportChannelSelect(discord.ui.ChannelSelect):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        self.setup_view.selected_channel = self.values[0]
+        selected_channel_option = self.values[0]
+        guild = interaction.guild
+        is_public = False
+        try:
+            channel = guild.get_channel(selected_channel_option.id) or await guild.fetch_channel(selected_channel_option.id)
+            everyone_perms = channel.permissions_for(guild.default_role)
+            if everyone_perms.view_channel:
+                is_public = True
+        except Exception:
+            pass
+
+        if is_public:
+            self.setup_view.selected_channel = None
+            self.setup_view.add_items()
+            await interaction.response.edit_message(embed=self.setup_view.build_embed(), view=self.setup_view)
+            await interaction.followup.send(
+                "❌ **Security Violation:** The selected channel is a public channel! The Growth Report contains sensitive member details (IDs, names) and **must only** be posted to private moderator/staff channels.",
+                ephemeral=True
+            )
+            return
+
+        self.setup_view.selected_channel = selected_channel_option
         self.setup_view.add_items()
         await interaction.response.edit_message(embed=self.setup_view.build_embed(), view=self.setup_view)
 
@@ -420,11 +441,11 @@ class WeeklyReportSetupView(discord.ui.View):
         self.clear_items()
         self.add_item(ReportStartPointSelect(self))
         self.add_item(ReportChannelSelect(self))
-        self.add_item(self.run_public_button)
+        self.add_item(self.run_channel_button)
         self.add_item(self.run_private_button)
         
-        # Enable public button only if channel is selected
-        self.run_public_button.disabled = self.selected_channel is None
+        # Enable channel button only if channel is selected
+        self.run_channel_button.disabled = self.selected_channel is None
 
     def get_start_point_label(self) -> str:
         if self.selected_start_point == "last_checkpoint":
@@ -489,16 +510,25 @@ class WeeklyReportSetupView(discord.ui.View):
         )
         return embed
 
-    @discord.ui.button(label="Post Publicly", style=discord.ButtonStyle.green, row=2)
-    async def run_public_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Post to Channel", style=discord.ButtonStyle.green, row=2)
+    async def run_channel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         if not self.selected_channel:
-            await interaction.followup.send("❌ Select a public channel first.", ephemeral=True)
+            await interaction.followup.send("❌ Select a private moderator channel first.", ephemeral=True)
             return
             
         channel_id = self.selected_channel.id
         channel = interaction.guild.get_channel(channel_id) or await interaction.guild.fetch_channel(channel_id)
         
+        # Double check channel privacy before posting
+        everyone_perms = channel.permissions_for(interaction.guild.default_role)
+        if everyone_perms.view_channel:
+            await interaction.followup.send(
+                f"❌ **Security Violation:** {channel.mention} is a public channel! The Growth Report contains sensitive member details (IDs, names) and **must only** be posted to private moderator/staff channels.",
+                ephemeral=True
+            )
+            return
+
         settings = self.cog.store.settings(interaction.guild_id)
         settings["report_channel_id"] = channel_id
         self.cog.store.save()
@@ -1369,10 +1399,10 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
         self.store.save()
             
         if channel:
-            # Send publicly
+            # Send to selected private channel
             await channel.send(embed=embed, file=discord_file)
             # Confirm ephemerally
-            await interaction.followup.send(f"📊 Weekly Growth Report generated and posted to {channel.mention}.", ephemeral=True)
+            await interaction.followup.send(f"📊 Weekly Growth Report generated and posted to private channel {channel.mention}.", ephemeral=True)
         else:
             # Send privately (ephemerally)
             await interaction.followup.send(embed=embed, file=discord_file, ephemeral=True)
