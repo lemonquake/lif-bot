@@ -129,6 +129,7 @@ class OnboardingStore:
         settings["public_message_template"] = templates[selected_index]
         settings.setdefault("dm_message_template", DEFAULT_DM_MESSAGE_TEMPLATE)
         settings.setdefault("default_posts", 1)
+        settings.setdefault("last_report_checkpoint", None)
         return state
 
     def settings(self, guild_id: int) -> Dict[str, Any]:
@@ -522,6 +523,7 @@ class OnboardingDashboardView(discord.ui.View):
         self.add_item(self.send_latest_button)
         self.add_item(self.send_selected_button)
         self.add_item(self.monday_report_button)
+        self.add_item(self.make_checkpoint_button)
         self.add_item(OnboardingGroupSelect(self))
         self.add_item(self.schedule_button)
         self.add_item(self.settings_button)
@@ -581,26 +583,27 @@ class OnboardingDashboardView(discord.ui.View):
 
         self.cog.store.scan_guild_members(guild)
         
-        # Calculate weekly reporting period
+        settings = self.cog.store.settings(interaction.guild_id)
+        checkpoint_str = settings.get("last_report_checkpoint")
         tz = self.cog.store.timezone(interaction.guild_id)
-        local_now = datetime.now(tz)
+        current_run_time = datetime.now(timezone.utc)
         
-        days_since_monday = local_now.weekday()
-        most_recent_monday = (local_now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        if local_now.weekday() == 0:
-            # Today is Monday, report previous week (Monday to Sunday)
-            start_date = (most_recent_monday - timedelta(days=7)).date()
-            end_date = (most_recent_monday - timedelta(days=1)).date()
-            period_desc = "Previous Week (Monday - Sunday)"
+        if checkpoint_str:
+            try:
+                checkpoint_dt = datetime.fromisoformat(checkpoint_str)
+                period_desc = "Stateful Checkpoint-based"
+            except Exception:
+                checkpoint_dt = current_run_time - timedelta(days=7)
+                period_desc = "Past 7 Days (Fallback)"
         else:
-            # Today is not Monday, report current week-to-date (Monday to Today)
-            start_date = most_recent_monday.date()
-            end_date = local_now.date()
-            period_desc = "Current Week-to-Date (Monday - Today)"
+            checkpoint_dt = current_run_time - timedelta(days=7)
+            period_desc = "Past 7 Days (Fallback)"
             
-        start_str = start_date.isoformat()
-        end_str = end_date.isoformat()
+        start_local = checkpoint_dt.astimezone(tz)
+        end_local = current_run_time.astimezone(tz)
+        
+        start_str = start_local.strftime('%Y-%m-%d %I:%M %p %Z')
+        end_str = end_local.strftime('%Y-%m-%d %I:%M %p %Z')
         
         state = self.cog.store.guild_state(interaction.guild_id)
         members = state.get("members", {})
@@ -611,21 +614,32 @@ class OnboardingDashboardView(discord.ui.View):
         daily_counts = {}
         
         for m in members.values():
-            join_date_str = m.get("join_date")
-            if not join_date_str and m.get("joined_at"):
-                join_date_str = m.get("joined_at")[:10]
+            joined_at_str = m.get("joined_at")
+            if not joined_at_str:
+                continue
+            try:
+                joined_at_dt = datetime.fromisoformat(joined_at_str)
+            except Exception:
+                continue
                 
-            if join_date_str and start_str <= join_date_str <= end_str:
+            if checkpoint_dt < joined_at_dt <= current_run_time:
                 report_members.append(m)
                 if m.get("welcomed_at"):
                     welcomed_count += 1
                 else:
                     pending_count += 1
+                
+                local_joined = joined_at_dt.astimezone(tz)
+                join_date_str = local_joined.strftime('%Y-%m-%d')
                 daily_counts[join_date_str] = daily_counts.get(join_date_str, 0) + 1
                 
         if not report_members:
+            # Advance checkpoint even when empty to mark this period as checked
+            settings["last_report_checkpoint"] = current_run_time.isoformat()
+            self.cog.store.save()
             await interaction.followup.send(
-                f"No new members found for reporting period **{start_str}** to **{end_str}** ({period_desc}).",
+                f"No new members found for reporting period **{start_str}** to **{end_str}** ({period_desc}).\n"
+                f"Checkpoint has been advanced to **{end_str}**.",
                 ephemeral=True
             )
             return
@@ -664,7 +678,7 @@ class OnboardingDashboardView(discord.ui.View):
         csv_buffer.close()
         
         # Name it with the date
-        report_date_str = local_now.strftime('%Y-%m-%d')
+        report_date_str = end_local.strftime('%Y-%m-%d')
         filename = f"weekly_report_{report_date_str}.csv"
         
         # Persist report in data/reports directory
@@ -697,6 +711,10 @@ class OnboardingDashboardView(discord.ui.View):
         if breakdown_msg:
             embed.add_field(name="📅 Daily Registration Breakdown", value=breakdown_msg, inline=False)
             
+        # Save checkpoint to the store
+        settings["last_report_checkpoint"] = current_run_time.isoformat()
+        self.cog.store.save()
+            
         await interaction.followup.send(embed=embed, file=discord_file, ephemeral=True)
         
         # Log to audit logs
@@ -705,6 +723,26 @@ class OnboardingDashboardView(discord.ui.View):
             "Weekly Report Generated",
             f"Generated weekly report for {start_str} to {end_str} with {len(report_members)} members."
         )
+
+    @discord.ui.button(label="Make Checkpoint", style=discord.ButtonStyle.gray, row=1)
+    async def make_checkpoint_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        checkpoint_time = datetime.now(timezone.utc)
+        settings = self.cog.store.settings(interaction.guild_id)
+        settings["last_report_checkpoint"] = checkpoint_time.isoformat()
+        self.cog.store.save()
+        
+        # Log to audit logs
+        tz = self.cog.store.timezone(interaction.guild_id)
+        local_time_str = checkpoint_time.astimezone(tz).strftime('%Y-%m-%d %I:%M %p %Z')
+        await self.cog.log_action(
+            interaction.guild_id,
+            "Reporting Checkpoint Created",
+            f"{interaction.user.mention} set a reporting checkpoint at {local_time_str}."
+        )
+        
+        # Respond and refresh dashboard
+        await self.refresh(interaction, notice=f"✅ Checkpoint created at **{local_time_str}**. Next report starts counting from here.")
 
     @discord.ui.button(label="Schedule Latest Group", style=discord.ButtonStyle.blurple, row=3)
     async def schedule_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -751,6 +789,17 @@ class OnboardingDashboardView(discord.ui.View):
         channel_id = settings.get("welcome_channel_id", DEFAULT_WELCOME_CHANNEL_ID)
         enabled = self.cog.store.is_enabled(self.guild_id)
         template_count = len(self.cog.store.public_templates(self.guild_id))
+        
+        checkpoint_val = settings.get("last_report_checkpoint")
+        tz = self.cog.store.timezone(self.guild_id)
+        if checkpoint_val:
+            try:
+                dt = datetime.fromisoformat(checkpoint_val)
+                checkpoint_str = dt.astimezone(tz).strftime('%Y-%m-%d %I:%M %p %Z')
+            except Exception:
+                checkpoint_str = "Invalid format"
+        else:
+            checkpoint_str = "None (will use 7-day fallback on next report run)"
 
         if self.selected_date_key not in groups:
             self.selected_date_key = latest_date
@@ -763,6 +812,7 @@ class OnboardingDashboardView(discord.ui.View):
             f"Public template: **{self.selected_template_index + 1} of {template_count}**\n"
             f"Scan window: **Today through {settings.get('scan_days', DEFAULT_SCAN_DAYS)} day(s) ago**\n"
             f"Timezone: **{settings.get('timezone', DEFAULT_TIMEZONE)}**\n"
+            f"Report Checkpoint: **{checkpoint_str}**\n"
             f"Latest group: **{self.cog.group_label(self.guild_id, latest_date) if latest_date else 'None'}** "
             f"({len(latest_members)} member(s))\n\n"
             "Scanning is safe: members are only marked welcomed after a successful channel post or successful DM."
