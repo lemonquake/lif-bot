@@ -316,6 +316,23 @@ class OnboardingStore:
         self.save()
 
 
+class WeeklyReportOptionsView(discord.ui.View):
+    def __init__(self, cog: "OnboardingCog"):
+        super().__init__(timeout=300)
+        self.cog = cog
+
+    @discord.ui.button(label="Download Private CSV", style=discord.ButtonStyle.blurple)
+    async def download_csv_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        await self.cog.run_weekly_report(interaction, channel=None)
+
+    @discord.ui.button(label="Post to Public Channel", style=discord.ButtonStyle.green)
+    async def post_channel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = self.cog.store.settings(interaction.guild_id)
+        default_id = settings.get("report_channel_id") or interaction.channel_id
+        await interaction.response.send_modal(WeeklyReportModal(self.cog, default_channel_id=default_id))
+
+
 class WeeklyReportModal(discord.ui.Modal, title="Run Weekly Growth Report"):
     channel_id = discord.ui.TextInput(
         label="Post publicly to Channel ID",
@@ -625,9 +642,15 @@ class OnboardingDashboardView(discord.ui.View):
 
     @discord.ui.button(label="Monday Weekly Report", style=discord.ButtonStyle.blurple, row=1)
     async def monday_report_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        settings = self.cog.store.settings(interaction.guild_id)
-        default_id = settings.get("report_channel_id") or interaction.channel_id
-        await interaction.response.send_modal(WeeklyReportModal(self.cog, default_channel_id=default_id))
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="📊 Weekly Onboarding Growth Report Options",
+                description="Choose whether to download the report privately as a CSV, or post it publicly to a selected channel with comprehensive statistics and a breakdown.",
+                color=0xE8C1A0
+            ),
+            view=WeeklyReportOptionsView(self.cog),
+            ephemeral=True
+        )
 
     @discord.ui.button(label="Make Checkpoint", style=discord.ButtonStyle.gray, row=1)
     async def make_checkpoint_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1040,7 +1063,7 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
             return await self.send_group(guild, date_key, settings.get("delivery_mode", DELIVERY_CHANNEL))
         return await self.send_latest_group(guild, settings.get("delivery_mode", DELIVERY_CHANNEL))
 
-    async def run_weekly_report(self, interaction: discord.Interaction, channel: discord.abc.Messageable):
+    async def run_weekly_report(self, interaction: discord.Interaction, channel: Optional[discord.abc.Messageable] = None):
         # Scan first to ensure we have up-to-date data
         guild = interaction.guild
         if not guild:
@@ -1181,11 +1204,14 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
         settings["last_report_checkpoint"] = current_run_time.isoformat()
         self.store.save()
             
-        # Send publicly
-        await channel.send(embed=embed, file=discord_file)
-
-        # Confirm ephemerally
-        await interaction.followup.send(f"📊 Weekly Growth Report generated and posted to {channel.mention}.", ephemeral=True)
+        if channel:
+            # Send publicly
+            await channel.send(embed=embed, file=discord_file)
+            # Confirm ephemerally
+            await interaction.followup.send(f"📊 Weekly Growth Report generated and posted to {channel.mention}.", ephemeral=True)
+        else:
+            # Send privately (ephemerally)
+            await interaction.followup.send(embed=embed, file=discord_file, ephemeral=True)
         
         # Log to audit logs
         await self.log_action(

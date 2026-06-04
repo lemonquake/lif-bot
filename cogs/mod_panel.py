@@ -329,10 +329,16 @@ class ModPanelView(discord.ui.View):
     async def weekly_report_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         cog = self.bot.get_cog("OnboardingCog")
         if cog:
-            from cogs.onboarding import WeeklyReportModal
-            settings = cog.store.settings(interaction.guild_id)
-            default_id = settings.get("report_channel_id") or interaction.channel_id
-            await interaction.response.send_modal(WeeklyReportModal(cog, default_channel_id=default_id))
+            from cogs.onboarding import WeeklyReportOptionsView
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="📊 Weekly Onboarding Growth Report Options",
+                    description="Choose whether to download the report privately as a CSV, or post it publicly to a selected channel with comprehensive statistics and a breakdown.",
+                    color=0xE8C1A0
+                ),
+                view=WeeklyReportOptionsView(cog),
+                ephemeral=True
+            )
         else:
             await interaction.response.send_message("Onboarding feature is currently unavailable.", ephemeral=True)
 
