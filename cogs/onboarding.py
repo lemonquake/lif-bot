@@ -574,155 +574,7 @@ class OnboardingDashboardView(discord.ui.View):
 
     @discord.ui.button(label="Monday Weekly Report", style=discord.ButtonStyle.blurple, row=1)
     async def monday_report_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        # Scan first to ensure we have up-to-date data
-        guild = interaction.guild
-        if not guild:
-            await interaction.followup.send("Guild not found.", ephemeral=True)
-            return
-
-        self.cog.store.scan_guild_members(guild)
-        
-        settings = self.cog.store.settings(interaction.guild_id)
-        checkpoint_str = settings.get("last_report_checkpoint")
-        tz = self.cog.store.timezone(interaction.guild_id)
-        current_run_time = datetime.now(timezone.utc)
-        
-        if checkpoint_str:
-            try:
-                checkpoint_dt = datetime.fromisoformat(checkpoint_str)
-                period_desc = "Stateful Checkpoint-based"
-            except Exception:
-                checkpoint_dt = current_run_time - timedelta(days=7)
-                period_desc = "Past 7 Days (Fallback)"
-        else:
-            checkpoint_dt = current_run_time - timedelta(days=7)
-            period_desc = "Past 7 Days (Fallback)"
-            
-        start_local = checkpoint_dt.astimezone(tz)
-        end_local = current_run_time.astimezone(tz)
-        
-        start_str = start_local.strftime('%Y-%m-%d %I:%M %p %Z')
-        end_str = end_local.strftime('%Y-%m-%d %I:%M %p %Z')
-        
-        state = self.cog.store.guild_state(interaction.guild_id)
-        members = state.get("members", {})
-        
-        report_members = []
-        welcomed_count = 0
-        pending_count = 0
-        daily_counts = {}
-        
-        for m in members.values():
-            joined_at_str = m.get("joined_at")
-            if not joined_at_str:
-                continue
-            try:
-                joined_at_dt = datetime.fromisoformat(joined_at_str)
-            except Exception:
-                continue
-                
-            if checkpoint_dt < joined_at_dt <= current_run_time:
-                report_members.append(m)
-                if m.get("welcomed_at"):
-                    welcomed_count += 1
-                else:
-                    pending_count += 1
-                
-                local_joined = joined_at_dt.astimezone(tz)
-                join_date_str = local_joined.strftime('%Y-%m-%d')
-                daily_counts[join_date_str] = daily_counts.get(join_date_str, 0) + 1
-                
-        if not report_members:
-            # Advance checkpoint even when empty to mark this period as checked
-            settings["last_report_checkpoint"] = current_run_time.isoformat()
-            self.cog.store.save()
-            await interaction.followup.send(
-                f"No new members found for reporting period **{start_str}** to **{end_str}** ({period_desc}).\n"
-                f"Checkpoint has been advanced to **{end_str}**.",
-                ephemeral=True
-            )
-            return
-            
-        # Sort by join time
-        report_members.sort(key=lambda x: x.get("joined_at", ""))
-        
-        # Build daily breakdown message
-        breakdown_lines = []
-        for day in sorted(daily_counts.keys()):
-            breakdown_lines.append(f"- **{day}**: {daily_counts[day]} new members")
-        breakdown_msg = "\n".join(breakdown_lines)
-        
-        # Determine peak day
-        peak_day = max(daily_counts, key=daily_counts.get)
-        peak_count = daily_counts[peak_day]
-        
-        # Generate CSV in memory
-        import io
-        import csv
-        
-        csv_buffer = io.StringIO()
-        writer = csv.writer(csv_buffer)
-        writer.writerow(["Discord ID", "Username", "Display Name", "Join Date", "Joined At", "Welcomed At"])
-        for m in report_members:
-            writer.writerow([
-                m.get("id"),
-                m.get("username"),
-                m.get("display_name"),
-                m.get("join_date"),
-                m.get("joined_at"),
-                m.get("welcomed_at") or "Not Welcomed"
-            ])
-            
-        csv_data = csv_buffer.getvalue()
-        csv_buffer.close()
-        
-        # Name it with the date
-        report_date_str = end_local.strftime('%Y-%m-%d')
-        filename = f"weekly_report_{report_date_str}.csv"
-        
-        # Persist report in data/reports directory
-        reports_dir = os.path.join("data", "reports")
-        os.makedirs(reports_dir, exist_ok=True)
-        persisted_path = os.path.join(reports_dir, filename)
-        with open(persisted_path, "w", encoding="utf-8", newline="") as f:
-            f.write(csv_data)
-            
-        # Create discord file attachment
-        discord_file = discord.File(
-            fp=io.BytesIO(csv_data.encode('utf-8')),
-            filename=filename
-        )
-        
-        # Embed/Message formatting
-        embed = discord.Embed(
-            title="📊 Monday Weekly Onboarding Report",
-            description=(
-                f"**Reporting Period:** {start_str} to {end_str}\n"
-                f"**Type:** {period_desc}\n\n"
-                f"👥 **Total New Members:** {len(report_members)}\n"
-                f"✅ **Welcomed:** {welcomed_count}\n"
-                f"⏳ **Pending Welcome:** {pending_count}\n"
-                f"🔥 **Peak Signup Day:** {peak_day} ({peak_count} signups)\n\n"
-                f"📁 A copy of the CSV was saved to `{persisted_path}`."
-            ),
-            color=0xE8C1A0
-        )
-        if breakdown_msg:
-            embed.add_field(name="📅 Daily Registration Breakdown", value=breakdown_msg, inline=False)
-            
-        # Save checkpoint to the store
-        settings["last_report_checkpoint"] = current_run_time.isoformat()
-        self.cog.store.save()
-            
-        await interaction.followup.send(embed=embed, file=discord_file, ephemeral=True)
-        
-        # Log to audit logs
-        await self.cog.log_action(
-            interaction.guild_id,
-            "Weekly Report Generated",
-            f"Generated weekly report for {start_str} to {end_str} with {len(report_members)} members."
-        )
+        await self.cog.run_weekly_report(interaction)
 
     @discord.ui.button(label="Make Checkpoint", style=discord.ButtonStyle.gray, row=1)
     async def make_checkpoint_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1134,6 +986,156 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
         if date_key:
             return await self.send_group(guild, date_key, settings.get("delivery_mode", DELIVERY_CHANNEL))
         return await self.send_latest_group(guild, settings.get("delivery_mode", DELIVERY_CHANNEL))
+
+    async def run_weekly_report(self, interaction: discord.Interaction):
+        # Scan first to ensure we have up-to-date data
+        guild = interaction.guild
+        if not guild:
+            await interaction.followup.send("Guild not found.", ephemeral=True)
+            return
+
+        self.store.scan_guild_members(guild)
+        
+        settings = self.store.settings(interaction.guild_id)
+        checkpoint_str = settings.get("last_report_checkpoint")
+        tz = self.store.timezone(interaction.guild_id)
+        current_run_time = datetime.now(timezone.utc)
+        
+        if checkpoint_str:
+            try:
+                checkpoint_dt = datetime.fromisoformat(checkpoint_str)
+                period_desc = "Stateful Checkpoint-based"
+            except Exception:
+                checkpoint_dt = current_run_time - timedelta(days=7)
+                period_desc = "Past 7 Days (Fallback)"
+        else:
+            checkpoint_dt = current_run_time - timedelta(days=7)
+            period_desc = "Past 7 Days (Fallback)"
+            
+        start_local = checkpoint_dt.astimezone(tz)
+        end_local = current_run_time.astimezone(tz)
+        
+        start_str = start_local.strftime('%Y-%m-%d %I:%M %p %Z')
+        end_str = end_local.strftime('%Y-%m-%d %I:%M %p %Z')
+        
+        state = self.store.guild_state(interaction.guild_id)
+        members = state.get("members", {})
+        
+        report_members = []
+        welcomed_count = 0
+        pending_count = 0
+        daily_counts = {}
+        
+        for m in members.values():
+            joined_at_str = m.get("joined_at")
+            if not joined_at_str:
+                continue
+            try:
+                joined_at_dt = datetime.fromisoformat(joined_at_str)
+            except Exception:
+                continue
+                
+            if checkpoint_dt < joined_at_dt <= current_run_time:
+                report_members.append(m)
+                if m.get("welcomed_at"):
+                    welcomed_count += 1
+                else:
+                    pending_count += 1
+                
+                local_joined = joined_at_dt.astimezone(tz)
+                join_date_str = local_joined.strftime('%Y-%m-%d')
+                daily_counts[join_date_str] = daily_counts.get(join_date_str, 0) + 1
+                
+        if not report_members:
+            # Advance checkpoint even when empty to mark this period as checked
+            settings["last_report_checkpoint"] = current_run_time.isoformat()
+            self.store.save()
+            await interaction.followup.send(
+                f"No new members found for reporting period **{start_str}** to **{end_str}** ({period_desc}).\n"
+                f"Checkpoint has been advanced to **{end_str}**.",
+                ephemeral=True
+            )
+            return
+            
+        # Sort by join time
+        report_members.sort(key=lambda x: x.get("joined_at", ""))
+        
+        # Build daily breakdown message
+        breakdown_lines = []
+        for day in sorted(daily_counts.keys()):
+            breakdown_lines.append(f"- **{day}**: {daily_counts[day]} new members")
+        breakdown_msg = "\n".join(breakdown_lines)
+        
+        # Determine peak day
+        peak_day = max(daily_counts, key=daily_counts.get)
+        peak_count = daily_counts[peak_day]
+        
+        # Generate CSV in memory
+        import io
+        import csv
+        
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer)
+        writer.writerow(["Discord ID", "Username", "Display Name", "Join Date", "Joined At", "Welcomed At"])
+        for m in report_members:
+            writer.writerow([
+                m.get("id"),
+                m.get("username"),
+                m.get("display_name"),
+                m.get("join_date"),
+                m.get("joined_at"),
+                m.get("welcomed_at") or "Not Welcomed"
+            ])
+            
+        csv_data = csv_buffer.getvalue()
+        csv_buffer.close()
+        
+        # Name it with the date
+        report_date_str = end_local.strftime('%Y-%m-%d')
+        filename = f"weekly_report_{report_date_str}.csv"
+        
+        # Persist report in data/reports directory
+        reports_dir = os.path.join("data", "reports")
+        os.makedirs(reports_dir, exist_ok=True)
+        persisted_path = os.path.join(reports_dir, filename)
+        with open(persisted_path, "w", encoding="utf-8", newline="") as f:
+            f.write(csv_data)
+            
+        # Create discord file attachment
+        discord_file = discord.File(
+            fp=io.BytesIO(csv_data.encode('utf-8')),
+            filename=filename
+        )
+        
+        # Embed/Message formatting
+        embed = discord.Embed(
+            title="📊 Monday Weekly Onboarding Report",
+            description=(
+                f"**Reporting Period:** {start_str} to {end_str}\n"
+                f"**Type:** {period_desc}\n\n"
+                f"👥 **Total New Members:** {len(report_members)}\n"
+                f"✅ **Welcomed:** {welcomed_count}\n"
+                f"⏳ **Pending Welcome:** {pending_count}\n"
+                f"🔥 **Peak Signup Day:** {peak_day} ({peak_count} signups)\n\n"
+                f"📁 A copy of the CSV was saved to `{persisted_path}`."
+            ),
+            color=0xE8C1A0
+        )
+        if breakdown_msg:
+            embed.add_field(name="📅 Daily Registration Breakdown", value=breakdown_msg, inline=False)
+            
+        # Save checkpoint to the store
+        settings["last_report_checkpoint"] = current_run_time.isoformat()
+        self.store.save()
+            
+        await interaction.followup.send(embed=embed, file=discord_file, ephemeral=True)
+        
+        # Log to audit logs
+        await self.log_action(
+            interaction.guild_id,
+            "Weekly Report Generated",
+            f"Generated weekly report for {start_str} to {end_str} with {len(report_members)} members."
+        )
 
 
 async def setup(bot):
