@@ -329,14 +329,11 @@ class ModPanelView(discord.ui.View):
     async def weekly_report_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         cog = self.bot.get_cog("OnboardingCog")
         if cog:
-            from cogs.onboarding import WeeklyReportOptionsView
+            from cogs.onboarding import WeeklyReportSetupView
+            setup_view = WeeklyReportSetupView(cog, interaction.guild_id)
             await interaction.response.send_message(
-                embed=discord.Embed(
-                    title="📊 Weekly Onboarding Growth Report Options",
-                    description="Choose whether to download the report privately as a CSV, or post it publicly to a selected channel with comprehensive statistics and a breakdown.",
-                    color=0xE8C1A0
-                ),
-                view=WeeklyReportOptionsView(cog),
+                embed=setup_view.build_embed(),
+                view=setup_view,
                 ephemeral=True
             )
         else:

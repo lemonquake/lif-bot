@@ -316,65 +316,207 @@ class OnboardingStore:
         self.save()
 
 
-class WeeklyReportOptionsView(discord.ui.View):
-    def __init__(self, cog: "OnboardingCog"):
+class ReportStartPointSelect(discord.ui.Select):
+    def __init__(self, setup_view: "WeeklyReportSetupView"):
+        self.setup_view = setup_view
+        options = []
+        checkpoint_str = setup_view.checkpoint_str
+        if checkpoint_str:
+            try:
+                dt = datetime.fromisoformat(checkpoint_str)
+                tz = setup_view.cog.store.timezone(setup_view.guild_id)
+                local_str = dt.astimezone(tz).strftime('%Y-%m-%d %I:%M %p')
+                options.append(
+                    discord.SelectOption(
+                        label="Since Last Checkpoint",
+                        value="last_checkpoint",
+                        description=f"Since {local_str}",
+                        default=setup_view.selected_start_point == "last_checkpoint"
+                    )
+                )
+            except Exception:
+                pass
+        
+        options.extend([
+            discord.SelectOption(
+                label="Past 7 Days",
+                value="7_days",
+                description="Default weekly report window",
+                default=setup_view.selected_start_point == "7_days"
+            ),
+            discord.SelectOption(
+                label="Past 14 Days",
+                value="14_days",
+                description="Past 2 weeks of signups",
+                default=setup_view.selected_start_point == "14_days"
+            ),
+            discord.SelectOption(
+                label="Past 30 Days",
+                value="30_days",
+                description="Past month of signups",
+                default=setup_view.selected_start_point == "30_days"
+            ),
+            discord.SelectOption(
+                label="Start of this Week",
+                value="start_of_week",
+                description="Since Monday 12:00 AM",
+                default=setup_view.selected_start_point == "start_of_week"
+            ),
+            discord.SelectOption(
+                label="Start of this Month",
+                value="start_of_month",
+                description="Since 1st of this month",
+                default=setup_view.selected_start_point == "start_of_month"
+            )
+        ])
+        
+        super().__init__(
+            placeholder="Choose report starting point...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.setup_view.selected_start_point = self.values[0]
+        self.setup_view.add_items()
+        await interaction.response.edit_message(embed=self.setup_view.build_embed(), view=self.setup_view)
+
+
+class ReportChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, setup_view: "WeeklyReportSetupView"):
+        self.setup_view = setup_view
+        super().__init__(
+            placeholder="Optional: Select channel to post publicly...",
+            min_values=1,
+            max_values=1,
+            channel_types=[discord.ChannelType.text],
+            row=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.setup_view.selected_channel = self.values[0]
+        self.setup_view.add_items()
+        await interaction.response.edit_message(embed=self.setup_view.build_embed(), view=self.setup_view)
+
+
+class WeeklyReportSetupView(discord.ui.View):
+    def __init__(self, cog: "OnboardingCog", guild_id: int):
         super().__init__(timeout=300)
         self.cog = cog
-
-    @discord.ui.button(label="Download Private CSV", style=discord.ButtonStyle.blurple)
-    async def download_csv_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        await self.cog.run_weekly_report(interaction, channel=None)
-
-    @discord.ui.button(label="Post to Public Channel", style=discord.ButtonStyle.green)
-    async def post_channel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        settings = self.cog.store.settings(interaction.guild_id)
-        default_id = settings.get("report_channel_id") or interaction.channel_id
-        await interaction.response.send_modal(WeeklyReportModal(self.cog, default_channel_id=default_id))
-
-
-class WeeklyReportModal(discord.ui.Modal, title="Run Weekly Growth Report"):
-    channel_id = discord.ui.TextInput(
-        label="Post publicly to Channel ID",
-        required=False,
-        max_length=24,
-        placeholder="Enter channel ID, or leave blank for this channel."
-    )
-
-    def __init__(self, cog: "OnboardingCog", default_channel_id: Optional[int] = None):
-        super().__init__()
-        self.cog = cog
-        if default_channel_id:
-            self.channel_id.default = str(default_channel_id)
-        else:
-            settings = cog.store.settings(cog.bot.guilds[0].id) if cog.bot.guilds else {}
-            saved_id = settings.get("report_channel_id") if settings else None
-            if saved_id:
-                self.channel_id.default = str(saved_id)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        self.guild_id = guild_id
         
-        target_channel_id = str(self.channel_id.value).strip()
-        if target_channel_id:
-            try:
-                channel_id = int(target_channel_id)
-                channel = interaction.guild.get_channel(channel_id) or await interaction.guild.fetch_channel(channel_id)
-            except Exception:
-                await interaction.followup.send("❌ Invalid channel ID. Please provide a valid channel ID.", ephemeral=True)
-                return
-        else:
-            channel = interaction.channel
+        # State
+        self.selected_start_point = "7_days"
+        self.selected_channel = None
+        
+        settings = cog.store.settings(guild_id)
+        self.checkpoint_str = settings.get("last_report_checkpoint")
+        
+        self.add_items()
 
-        if not channel or not hasattr(channel, "send"):
-            await interaction.followup.send("❌ I cannot find or access that channel, or it cannot receive messages.", ephemeral=True)
+    def add_items(self):
+        self.clear_items()
+        self.add_item(ReportStartPointSelect(self))
+        self.add_item(ReportChannelSelect(self))
+        self.add_item(self.run_public_button)
+        self.add_item(self.run_private_button)
+        
+        # Enable public button only if channel is selected
+        self.run_public_button.disabled = self.selected_channel is None
+
+    def get_start_point_label(self) -> str:
+        if self.selected_start_point == "last_checkpoint":
+            return "Last Checkpoint"
+        elif self.selected_start_point == "7_days":
+            return "Past 7 Days"
+        elif self.selected_start_point == "14_days":
+            return "Past 14 Days"
+        elif self.selected_start_point == "30_days":
+            return "Past 30 Days"
+        elif self.selected_start_point == "start_of_week":
+            return "Start of Week"
+        elif self.selected_start_point == "start_of_month":
+            return "Start of Month"
+        return "Custom"
+
+    def get_start_datetime(self, now: datetime, tz) -> datetime:
+        local_now = now.astimezone(tz)
+        if self.selected_start_point == "last_checkpoint":
+            if self.checkpoint_str:
+                try:
+                    return datetime.fromisoformat(self.checkpoint_str)
+                except Exception:
+                    pass
+            return now - timedelta(days=7)
+        elif self.selected_start_point == "7_days":
+            return now - timedelta(days=7)
+        elif self.selected_start_point == "14_days":
+            return now - timedelta(days=14)
+        elif self.selected_start_point == "30_days":
+            return now - timedelta(days=30)
+        elif self.selected_start_point == "start_of_week":
+            days_since_monday = local_now.weekday()
+            dt = (local_now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
+            return dt.astimezone(timezone.utc)
+        elif self.selected_start_point == "start_of_month":
+            dt = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            return dt.astimezone(timezone.utc)
+        return now - timedelta(days=7)
+
+    def build_embed(self) -> discord.Embed:
+        tz = self.cog.store.timezone(self.guild_id)
+        current_run_time = datetime.now(timezone.utc)
+        
+        start_dt = self.get_start_datetime(current_run_time, tz)
+        start_str = start_dt.astimezone(tz).strftime('%Y-%m-%d %I:%M %p %Z')
+        end_str = current_run_time.astimezone(tz).strftime('%Y-%m-%d %I:%M %p %Z')
+        
+        channel_mention = f"<#{self.selected_channel.id}>" if self.selected_channel else "🔒 Private Download"
+        
+        desc = (
+            "Configure your Growth Report using the menus below.\n\n"
+            f"📅 **Start Point:** {self.get_start_point_label()}\n"
+            f"🌐 **Destination:** {channel_mention}\n\n"
+            f"⏱️ **Reporting Period:** `{start_str}` to `{end_str}`"
+        )
+        
+        embed = discord.Embed(
+            title="📊 Weekly Growth Report Setup",
+            description=desc,
+            color=0xE8C1A0
+        )
+        return embed
+
+    @discord.ui.button(label="Post Publicly", style=discord.ButtonStyle.green, row=2)
+    async def run_public_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        if not self.selected_channel:
+            await interaction.followup.send("❌ Select a public channel first.", ephemeral=True)
             return
-
+            
+        channel_id = self.selected_channel.id
+        channel = interaction.guild.get_channel(channel_id) or await interaction.guild.fetch_channel(channel_id)
+        
         settings = self.cog.store.settings(interaction.guild_id)
-        settings["report_channel_id"] = channel.id
+        settings["report_channel_id"] = channel_id
         self.cog.store.save()
+        
+        await self.cog.run_weekly_report(
+            interaction, 
+            channel=channel, 
+            start_point_type=self.selected_start_point
+        )
 
-        await self.cog.run_weekly_report(interaction, channel)
+    @discord.ui.button(label="Download Privately", style=discord.ButtonStyle.blurple, row=2)
+    async def run_private_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        await self.cog.run_weekly_report(
+            interaction, 
+            channel=None, 
+            start_point_type=self.selected_start_point
+        )
 
 
 class OnboardingSettingsModal(discord.ui.Modal, title="Onboarding Settings"):
@@ -642,13 +784,10 @@ class OnboardingDashboardView(discord.ui.View):
 
     @discord.ui.button(label="Monday Weekly Report", style=discord.ButtonStyle.blurple, row=1)
     async def monday_report_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        setup_view = WeeklyReportSetupView(self.cog, interaction.guild_id)
         await interaction.response.send_message(
-            embed=discord.Embed(
-                title="📊 Weekly Onboarding Growth Report Options",
-                description="Choose whether to download the report privately as a CSV, or post it publicly to a selected channel with comprehensive statistics and a breakdown.",
-                color=0xE8C1A0
-            ),
-            view=WeeklyReportOptionsView(self.cog),
+            embed=setup_view.build_embed(),
+            view=setup_view,
             ephemeral=True
         )
 
@@ -1063,7 +1202,12 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
             return await self.send_group(guild, date_key, settings.get("delivery_mode", DELIVERY_CHANNEL))
         return await self.send_latest_group(guild, settings.get("delivery_mode", DELIVERY_CHANNEL))
 
-    async def run_weekly_report(self, interaction: discord.Interaction, channel: Optional[discord.abc.Messageable] = None):
+    async def run_weekly_report(
+        self, 
+        interaction: discord.Interaction, 
+        channel: Optional[discord.abc.Messageable] = None,
+        start_point_type: str = "7_days"
+    ):
         # Scan first to ensure we have up-to-date data
         guild = interaction.guild
         if not guild:
@@ -1076,17 +1220,37 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
         checkpoint_str = settings.get("last_report_checkpoint")
         tz = self.store.timezone(interaction.guild_id)
         current_run_time = datetime.now(timezone.utc)
+        local_now = current_run_time.astimezone(tz)
         
-        if checkpoint_str:
-            try:
-                checkpoint_dt = datetime.fromisoformat(checkpoint_str)
-                period_desc = "Stateful Checkpoint-based"
-            except Exception:
+        if start_point_type == "last_checkpoint":
+            if checkpoint_str:
+                try:
+                    checkpoint_dt = datetime.fromisoformat(checkpoint_str)
+                    period_desc = "Since Last Checkpoint"
+                except Exception:
+                    checkpoint_dt = current_run_time - timedelta(days=7)
+                    period_desc = "Past 7 Days (Fallback)"
+            else:
                 checkpoint_dt = current_run_time - timedelta(days=7)
                 period_desc = "Past 7 Days (Fallback)"
-        else:
+        elif start_point_type == "14_days":
+            checkpoint_dt = current_run_time - timedelta(days=14)
+            period_desc = "Past 14 Days"
+        elif start_point_type == "30_days":
+            checkpoint_dt = current_run_time - timedelta(days=30)
+            period_desc = "Past 30 Days"
+        elif start_point_type == "start_of_week":
+            days_since_monday = local_now.weekday()
+            dt = (local_now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
+            checkpoint_dt = dt.astimezone(timezone.utc)
+            period_desc = "Start of this Week (Monday)"
+        elif start_point_type == "start_of_month":
+            dt = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            checkpoint_dt = dt.astimezone(timezone.utc)
+            period_desc = "Start of this Month"
+        else:  # default to "7_days"
             checkpoint_dt = current_run_time - timedelta(days=7)
-            period_desc = "Past 7 Days (Fallback)"
+            period_desc = "Past 7 Days"
             
         start_local = checkpoint_dt.astimezone(tz)
         end_local = current_run_time.astimezone(tz)
