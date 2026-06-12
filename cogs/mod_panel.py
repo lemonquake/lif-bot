@@ -18,7 +18,9 @@ PANEL_DESCRIPTION = (
     "**Basic Message:** Create standard conversational text.\n"
     "**Live Stats:** Post and auto-refresh a server health dashboard.\n"
     "**TikTok Connector:** Post a guided account-connection panel for creators.\n"
+    "**Scheduled Messaging:** Manage weekly reminders and scheduled announcements.\n"
     "**Weekly Report:** Run stateful weekly member growth and onboarding audits.\n"
+    "**Daily Report:** Run daily member growth and onboarding audits.\n"
     "**Monthly Joins:** View server join statistics and analytics for any specific month.\n"
     "**Most Engaged:** View top non-mod members by messages and reactions.\n"
 )
@@ -338,6 +340,28 @@ class ModPanelView(discord.ui.View):
             )
         else:
             await interaction.response.send_message("Onboarding feature is currently unavailable.", ephemeral=True)
+
+    @discord.ui.button(label="Daily Report", style=discord.ButtonStyle.blurple, custom_id="panel:daily_report", row=3)
+    async def daily_report_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cog = self.bot.get_cog("OnboardingCog")
+        if cog:
+            from cogs.onboarding import DailyReportSetupView
+            setup_view = DailyReportSetupView(cog, interaction.guild_id)
+            await interaction.response.send_message(
+                embed=setup_view.build_embed(),
+                view=setup_view,
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message("Onboarding feature is currently unavailable.", ephemeral=True)
+
+    @discord.ui.button(label="Scheduled Messaging", style=discord.ButtonStyle.blurple, custom_id="panel:scheduled_msg", row=3)
+    async def scheduled_msg_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cog = self.bot.get_cog("SchedulerCog")
+        if cog:
+            await cog.launch_dashboard(interaction)
+        else:
+            await interaction.response.send_message("Scheduled Messaging feature is currently unavailable.", ephemeral=True)
 
     async def update_panel(self, interaction: discord.Interaction):
         try:

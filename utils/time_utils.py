@@ -2,10 +2,11 @@ from datetime import datetime, timedelta
 import zoneinfo
 from typing import List, Tuple
 
-def generate_date_options(days: int = 14) -> List[Tuple[str, str]]:
-    """Returns a list of tuples (Label, ISO Value) for the next X days."""
+def generate_date_options(days: int = 14, timezone_str: str = "UTC") -> List[Tuple[str, str]]:
+    """Returns a list of tuples (Label, ISO Value) for the next X days in the target timezone."""
     options = []
-    now = datetime.now()
+    tz = zoneinfo.ZoneInfo(timezone_str)
+    now = datetime.now(tz)
     for i in range(days):
         dt = now + timedelta(days=i)
         label = dt.strftime("%a, %b %d")
@@ -42,9 +43,20 @@ def generate_minute_options() -> List[Tuple[str, str]]:
 def parse_schedule_time(date_str: str, hour_str: str, min_str: str, timezone_str: str) -> datetime:
     """Parses selections into a UTC datetime object."""
     date_part = datetime.strptime(date_str, "%Y-%m-%d")
-    hour = int(hour_str)
-    minute = int(min_str)
     
+    if ":" in hour_str:
+        h_part, m_part = hour_str.split(":", 1)
+        hour = int(h_part)
+        minute = int(m_part)
+        if min_str.upper() in {"AM", "PM"}:
+            if min_str.upper() == "PM" and hour < 12:
+                hour += 12
+            elif min_str.upper() == "AM" and hour == 12:
+                hour = 0
+    else:
+        hour = int(hour_str)
+        minute = int(min_str)
+        
     dt_naive = datetime(date_part.year, date_part.month, date_part.day, hour, minute)
     tz = zoneinfo.ZoneInfo(timezone_str)
     dt_aware = dt_naive.replace(tzinfo=tz)

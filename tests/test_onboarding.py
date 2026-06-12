@@ -78,7 +78,9 @@ class FakeBot:
 
 
 def local_datetime(days_ago):
-    return datetime(2026, 5, 15 - days_ago, 10, 0, tzinfo=MANILA)
+    from datetime import timedelta
+    now_local = datetime.now(timezone.utc).astimezone(MANILA)
+    return (now_local - timedelta(days=days_ago)).replace(hour=10, minute=0, second=0, microsecond=0)
 
 
 class OnboardingStoreTests(unittest.TestCase):
@@ -106,11 +108,17 @@ class OnboardingStoreTests(unittest.TestCase):
 
         groups = store.pending_groups(guild, now=local_datetime(0), scan=True)
 
-        self.assertEqual([member["id"] for member in groups["2026-05-15"]], [1])
-        self.assertEqual([member["id"] for member in groups["2026-05-14"]], [2])
-        self.assertEqual(groups["2026-05-13"], [])
-        self.assertEqual([member["id"] for member in groups["2026-05-12"]], [4])
-        self.assertNotIn("2026-05-11", groups)
+        today_key = local_datetime(0).date().isoformat()
+        yesterday_key = local_datetime(1).date().isoformat()
+        two_days_key = local_datetime(2).date().isoformat()
+        three_days_key = local_datetime(3).date().isoformat()
+        four_days_key = local_datetime(4).date().isoformat()
+
+        self.assertEqual([member["id"] for member in groups[today_key]], [1])
+        self.assertEqual([member["id"] for member in groups[yesterday_key]], [2])
+        self.assertEqual(groups[two_days_key], [])
+        self.assertEqual([member["id"] for member in groups[three_days_key]], [4])
+        self.assertNotIn(four_days_key, groups)
 
     def test_scan_does_not_mark_members_welcomed(self):
         store = self.make_store()
@@ -212,6 +220,65 @@ class OnboardingSendTests(unittest.IsolatedAsyncioTestCase):
         state = cog.store.guild_state(guild.id)
         self.assertIsNotNone(state["members"]["1"]["welcomed_at"])
         self.assertIsNone(state["members"]["2"]["welcomed_at"])
+
+    async def test_run_daily_report_sends_privately_and_does_not_modify_weekly_checkpoint(self):
+        guild = FakeGuild()
+        guild.members = [
+            FakeMember(1, guild, local_datetime(0), "Today Join"),
+            FakeMember(2, guild, local_datetime(2), "Two Days Ago Join"),
+        ]
+        cog = self.make_cog(guild)
+        
+        cog.store.scan_guild_members(guild)
+        
+        interaction = FakeInteraction(guild)
+        await cog.run_daily_report(interaction, channel=None, start_point_type="24_hours")
+        
+        self.assertEqual(len(interaction.followup.sent), 1)
+        args, kwargs = interaction.followup.sent[0]
+        
+        embed = kwargs.get("embed")
+        self.assertIsNotNone(embed)
+        self.assertEqual(embed.title, "📊 Daily Onboarding Report")
+        self.assertIn("Total New Members:** 1", embed.description)
+        
+        file_attachment = kwargs.get("file")
+        self.assertIsNotNone(file_attachment)
+        self.assertTrue(file_attachment.filename.startswith("daily_report_"))
+        
+        settings = cog.store.settings(guild.id)
+        self.assertIsNone(settings.get("last_report_checkpoint"))
+
+    async def test_run_daily_report_no_members(self):
+        guild = FakeGuild()
+        guild.members = [
+            FakeMember(2, guild, local_datetime(2), "Two Days Ago Join"),
+        ]
+        cog = self.make_cog(guild)
+        cog.store.scan_guild_members(guild)
+        
+        interaction = FakeInteraction(guild)
+        await cog.run_daily_report(interaction, channel=None, start_point_type="24_hours")
+        
+        self.assertEqual(len(interaction.followup.sent), 1)
+        args, kwargs = interaction.followup.sent[0]
+        self.assertIn("No new members found for reporting period", args[0])
+
+
+class FakeFollowup:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, *args, **kwargs):
+        self.sent.append((args, kwargs))
+
+
+class FakeInteraction:
+    def __init__(self, guild, user=None):
+        self.guild = guild
+        self.guild_id = guild.id
+        self.user = user or FakeMember(99, guild, local_datetime(0))
+        self.followup = FakeFollowup()
 
 
 if __name__ == "__main__":

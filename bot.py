@@ -56,6 +56,7 @@ class LoveInFaithBot(commands.Bot):
             'cogs.live_stats',
             'cogs.tiktok_connector',
             'cogs.engagement',
+            'cogs.transcript_recorder',
         ]
         for cog in cogs:
             try:

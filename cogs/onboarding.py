@@ -266,7 +266,7 @@ class OnboardingStore:
         delivery_mode: str,
         public_message_templates: List[str],
         dm_message_template: str,
-        report_channel_id: Optional[int],
+        report_channel_id: Optional[int] = None,
     ) -> None:
         settings = self.settings(guild_id)
         templates = [ensure_public_mentions(template) for template in public_message_templates]
@@ -385,7 +385,7 @@ class ReportStartPointSelect(discord.ui.Select):
 
 
 class ReportChannelSelect(discord.ui.ChannelSelect):
-    def __init__(self, setup_view: "WeeklyReportSetupView"):
+    def __init__(self, setup_view: Any):
         self.setup_view = setup_view
         super().__init__(
             placeholder="Select private mod channel (e.g. #staff)...",
@@ -543,6 +543,146 @@ class WeeklyReportSetupView(discord.ui.View):
     async def run_private_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         await self.cog.run_weekly_report(
+            interaction, 
+            channel=None, 
+            start_point_type=self.selected_start_point
+        )
+class DailyReportStartPointSelect(discord.ui.Select):
+    def __init__(self, setup_view: "DailyReportSetupView"):
+        self.setup_view = setup_view
+        options = [
+            discord.SelectOption(
+                label="Past 24 Hours",
+                value="24_hours",
+                description="Default daily report window",
+                default=setup_view.selected_start_point == "24_hours"
+            ),
+            discord.SelectOption(
+                label="Start of Today",
+                value="start_of_day",
+                description="Since midnight local time",
+                default=setup_view.selected_start_point == "start_of_day"
+            ),
+            discord.SelectOption(
+                label="Past 2 Days",
+                value="2_days",
+                description="Past 48 hours of signups",
+                default=setup_view.selected_start_point == "2_days"
+            )
+        ]
+        
+        super().__init__(
+            placeholder="Choose report starting point...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.setup_view.selected_start_point = self.values[0]
+        self.setup_view.add_items()
+        await interaction.response.edit_message(embed=self.setup_view.build_embed(), view=self.setup_view)
+
+
+class DailyReportSetupView(discord.ui.View):
+    def __init__(self, cog: "OnboardingCog", guild_id: int):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild_id = guild_id
+        
+        # State
+        self.selected_start_point = "24_hours"
+        self.selected_channel = None
+        
+        self.add_items()
+
+    def add_items(self):
+        self.clear_items()
+        self.add_item(DailyReportStartPointSelect(self))
+        self.add_item(ReportChannelSelect(self))
+        self.add_item(self.run_channel_button)
+        self.add_item(self.run_private_button)
+        
+        # Enable channel button only if channel is selected
+        self.run_channel_button.disabled = self.selected_channel is None
+
+    def get_start_point_label(self) -> str:
+        if self.selected_start_point == "24_hours":
+            return "Past 24 Hours"
+        elif self.selected_start_point == "start_of_day":
+            return "Start of Today"
+        elif self.selected_start_point == "2_days":
+            return "Past 2 Days"
+        return "Custom"
+
+    def get_start_datetime(self, now: datetime, tz) -> datetime:
+        local_now = now.astimezone(tz)
+        if self.selected_start_point == "start_of_day":
+            dt = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            return dt.astimezone(timezone.utc)
+        elif self.selected_start_point == "2_days":
+            return now - timedelta(days=2)
+        else: # default to "24_hours"
+            return now - timedelta(hours=24)
+
+    def build_embed(self) -> discord.Embed:
+        tz = self.cog.store.timezone(self.guild_id)
+        current_run_time = datetime.now(timezone.utc)
+        
+        start_dt = self.get_start_datetime(current_run_time, tz)
+        start_str = start_dt.astimezone(tz).strftime('%Y-%m-%d %I:%M %p %Z')
+        end_str = current_run_time.astimezone(tz).strftime('%Y-%m-%d %I:%M %p %Z')
+        
+        channel_mention = f"<#{self.selected_channel.id}>" if self.selected_channel else "🔒 Private Download"
+        
+        desc = (
+            "Configure your Daily Growth Report using the menus below.\n\n"
+            f"📅 **Start Point:** {self.get_start_point_label()}\n"
+            f"🌐 **Destination:** {channel_mention}\n\n"
+            f"⏱️ **Reporting Period:** `{start_str}` to `{end_str}`"
+        )
+        
+        embed = discord.Embed(
+            title="📊 Daily Growth Report Setup",
+            description=desc,
+            color=0xE8C1A0
+        )
+        return embed
+
+    @discord.ui.button(label="Post to Channel", style=discord.ButtonStyle.green, row=2)
+    async def run_channel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        if not self.selected_channel:
+            await interaction.followup.send("❌ Select a private moderator channel first.", ephemeral=True)
+            return
+            
+        channel_id = self.selected_channel.id
+        channel = interaction.guild.get_channel(channel_id) or await interaction.guild.fetch_channel(channel_id)
+        
+        # Double check channel privacy before posting
+        everyone_perms = channel.permissions_for(interaction.guild.default_role)
+        if everyone_perms.view_channel:
+            await interaction.followup.send(
+                f"❌ **Security Violation:** {channel.mention} is a public channel! The Growth Report contains sensitive member details (IDs, names) and **must only** be posted to private moderator/staff channels.",
+                ephemeral=True
+            )
+            return
+
+        settings = self.cog.store.settings(interaction.guild_id)
+        settings["report_channel_id"] = channel_id
+        self.cog.store.save()
+        
+        await self.cog.run_daily_report(
+            interaction, 
+            channel=channel, 
+            start_point_type=self.selected_start_point
+        )
+
+    @discord.ui.button(label="Download Privately", style=discord.ButtonStyle.blurple, row=2)
+    async def run_private_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        await self.cog.run_daily_report(
             interaction, 
             channel=None, 
             start_point_type=self.selected_start_point
@@ -763,6 +903,7 @@ class OnboardingDashboardView(discord.ui.View):
         self.add_item(self.send_latest_button)
         self.add_item(self.send_selected_button)
         self.add_item(self.monday_report_button)
+        self.add_item(self.daily_report_button)
         self.add_item(self.make_checkpoint_button)
         self.add_item(OnboardingGroupSelect(self))
         self.add_item(self.schedule_button)
@@ -815,6 +956,15 @@ class OnboardingDashboardView(discord.ui.View):
     @discord.ui.button(label="Monday Weekly Report", style=discord.ButtonStyle.blurple, row=1)
     async def monday_report_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         setup_view = WeeklyReportSetupView(self.cog, interaction.guild_id)
+        await interaction.response.send_message(
+            embed=setup_view.build_embed(),
+            view=setup_view,
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Daily Report", style=discord.ButtonStyle.blurple, row=1)
+    async def daily_report_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        setup_view = DailyReportSetupView(self.cog, interaction.guild_id)
         await interaction.response.send_message(
             embed=setup_view.build_embed(),
             view=setup_view,
@@ -1412,6 +1562,142 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
             interaction.guild_id,
             "Weekly Report Generated",
             f"Generated weekly report for {start_str} to {end_str} with {len(report_members)} members."
+        )
+
+    async def run_daily_report(
+        self, 
+        interaction: discord.Interaction, 
+        channel: Optional[discord.abc.Messageable] = None,
+        start_point_type: str = "24_hours"
+    ):
+        # Scan first to ensure we have up-to-date data
+        guild = interaction.guild
+        if not guild:
+            await interaction.followup.send("Guild not found.", ephemeral=True)
+            return
+
+        self.store.scan_guild_members(guild)
+        
+        settings = self.store.settings(interaction.guild_id)
+        tz = self.store.timezone(interaction.guild_id)
+        current_run_time = datetime.now(timezone.utc)
+        local_now = current_run_time.astimezone(tz)
+        
+        if start_point_type == "start_of_day":
+            dt = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            checkpoint_dt = dt.astimezone(timezone.utc)
+            period_desc = "Start of Today"
+        elif start_point_type == "2_days":
+            checkpoint_dt = current_run_time - timedelta(days=2)
+            period_desc = "Past 2 Days"
+        else:  # default to "24_hours"
+            checkpoint_dt = current_run_time - timedelta(hours=24)
+            period_desc = "Past 24 Hours"
+            
+        start_local = checkpoint_dt.astimezone(tz)
+        end_local = current_run_time.astimezone(tz)
+        
+        start_str = start_local.strftime('%Y-%m-%d %I:%M %p %Z')
+        end_str = end_local.strftime('%Y-%m-%d %I:%M %p %Z')
+        
+        state = self.store.guild_state(interaction.guild_id)
+        members = state.get("members", {})
+        
+        report_members = []
+        welcomed_count = 0
+        pending_count = 0
+        
+        for m in members.values():
+            joined_at_str = m.get("joined_at")
+            if not joined_at_str:
+                continue
+            try:
+                joined_at_dt = datetime.fromisoformat(joined_at_str)
+            except Exception:
+                continue
+                
+            if checkpoint_dt < joined_at_dt <= current_run_time:
+                report_members.append(m)
+                if m.get("welcomed_at"):
+                    welcomed_count += 1
+                else:
+                    pending_count += 1
+                
+        if not report_members:
+            await interaction.followup.send(
+                f"No new members found for reporting period **{start_str}** to **{end_str}** ({period_desc}).",
+                ephemeral=True
+            )
+            return
+            
+        # Sort by join time
+        report_members.sort(key=lambda x: x.get("joined_at", ""))
+        
+        # Generate CSV in memory
+        import io
+        import csv
+        
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer)
+        writer.writerow(["Discord ID", "Username", "Display Name", "Join Date", "Joined At", "Welcomed At"])
+        for m in report_members:
+            writer.writerow([
+                m.get("id"),
+                m.get("username"),
+                m.get("display_name"),
+                m.get("join_date"),
+                m.get("joined_at"),
+                m.get("welcomed_at") or "Not Welcomed"
+            ])
+            
+        csv_data = csv_buffer.getvalue()
+        csv_buffer.close()
+        
+        # Name it with the date
+        report_date_str = end_local.strftime('%Y-%m-%d')
+        filename = f"daily_report_{report_date_str}.csv"
+        
+        # Persist report in data/reports directory
+        reports_dir = os.path.join("data", "reports")
+        os.makedirs(reports_dir, exist_ok=True)
+        persisted_path = os.path.join(reports_dir, filename)
+        with open(persisted_path, "w", encoding="utf-8", newline="") as f:
+            f.write(csv_data)
+            
+        # Create discord file attachment
+        discord_file = discord.File(
+            fp=io.BytesIO(csv_data.encode('utf-8')),
+            filename=filename
+        )
+        
+        # Embed/Message formatting
+        embed = discord.Embed(
+            title="📊 Daily Onboarding Report",
+            description=(
+                f"**Reporting Period:** {start_str} to {end_str}\n"
+                f"**Type:** {period_desc}\n\n"
+                f"👥 **Total New Members:** {len(report_members)}\n"
+                f"✅ **Welcomed:** {welcomed_count}\n"
+                f"⏳ **Pending Welcome:** {pending_count}\n\n"
+                f"📁 A copy of the CSV was saved to `{persisted_path}`."
+            ),
+            color=0xE8C1A0
+        )
+            
+        if channel:
+            # Send to selected private channel
+            await channel.send(embed=embed, file=discord_file)
+            # Confirm ephemerally
+            await interaction.followup.send(f"📊 Daily Growth Report generated and posted to private channel {channel.mention}.", ephemeral=True)
+        else:
+            # Send privately (ephemerally)
+            await interaction.followup.send(embed=embed, file=discord_file, ephemeral=True)
+        
+        # Log to audit logs
+        await self.log_action(
+            interaction.guild_id,
+            "Daily Report Generated",
+            f"Generated daily report for {start_str} to {end_str} with {len(report_members)} members."
         )
 
 
